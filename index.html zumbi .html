@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Zumbis na Câmera</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; font-family: sans-serif; color: #fff; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #video { position: fixed; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
+  #tela { position: fixed; top: 0; left: 0; width: 100%; height: 100%; }
+  #hud { position: fixed; top: 8px; left: 0; right: 0; display: flex; justify-content: space-between; padding: 0 14px; font-size: 1.1rem; font-weight: bold; text-shadow: 0 1px 3px #000; pointer-events: none; box-sizing: border-box; }
+  #aviso { position: fixed; top: 40px; left: 0; right: 0; text-align: center; font-size: .85rem; color: #fbbf24; text-shadow: 0 1px 3px #000; padding: 0 12px; pointer-events: none; }
+  #diag { position: fixed; left: 6px; bottom: 6px; z-index: 10; font-size: .7rem; background: rgba(0,0,0,.55); padding: 4px 6px; border-radius: 4px; pointer-events: none; }
+  #atirar { position: fixed; right: 20px; bottom: 30px; width: 96px; height: 96px; border-radius: 50%; border: 4px solid #fff; background: rgba(220,38,38,.75); color: #fff; font-size: 1rem; font-weight: bold; touch-action: none; }
+  #menu { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.82); display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 24px; gap: 12px; }
+  #menu h1 { margin: 0; font-size: 1.8rem; }
+  #menu p { margin: 0; max-width: 340px; line-height: 1.4; }
+  #menu button { font-size: 1.2rem; padding: 14px 28px; border: none; border-radius: 10px; background: #16a34a; color: #fff; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="tela"></canvas>
+<div id="hud"><span id="vidas"></span><span id="pontos"></span></div>
+<div id="aviso"></div>
+<button id="atirar">ATIRAR</button>
+<div id="menu">
+  <h1 id="titulo">Zumbis na Câmera</h1>
+  <p id="texto">Segure o celular em pé (retrato). Gire o corpo para procurar zumbis. Atire quando a mira, no centro da tela, estiver sobre um deles. Não deixe que cheguem perto!</p>
+  <button id="iniciar">Iniciar</button>
+</div>
+<div id="diag"></div>
+
+<script>
+// LOGICA-INICIO
+const RAD = Math.PI / 180;
+const ALTURA_OLHOS = 1.5;   // metros
+const ALTURA_ZUMBI = 1.7;   // metros
+
+// Matriz de rotação do celular a partir dos ângulos do sensor (alfa, beta, gama em graus)
+function matriz(alfa, beta, gama) {
+  const a = alfa * RAD, b = beta * RAD, g = gama * RAD;
+  const cA = Math.cos(a), sA = Math.sin(a), cB = Math.cos(b), sB = Math.sin(b), cG = Math.cos(g), sG = Math.sin(g);
+  return [
+    [cA*cG - sA*sB*sG, -sA*cB, cA*sG + sA*sB*cG],
+    [sA*cG + cA*sB*sG,  cA*cB, sA*sG - cA*sB*cG],
+    [-cB*sG,            sB,    cB*cG]
+  ];
+}
+
+// Direção para onde a câmera traseira aponta (x leste, y norte, z cima)
+function direcaoCamera(R) { return [-R[0][2], -R[1][2], -R[2][2]]; }
+
+// Rumo (em graus) para onde a câmera aponta, no plano horizontal
+function rumo(R) { const d = direcaoCamera(R); return Math.atan2(d[0], d[1]) / RAD; }
+
+// Projeta um ponto do mundo na tela. Retorna null se estiver atrás da câmera.
+function projetar(R, p, largura, altura, f) {
+  const vx = R[0][0]*p[0] + R[1][0]*p[1] + R[2][0]*p[2];
+  const vy = R[0][1]*p[0] + R[1][1]*p[1] + R[2][1]*p[2];
+  const vz = R[0][2]*p[0] + R[1][2]*p[1] + R[2][2]*p[2];
+  const prof = -vz;
+  if (prof < 0.1) return null;
+  return { x: largura/2 + f*vx/prof, y: altura/2 - f*vy/prof, prof: prof };
+}
+
+function posicaoZumbi(z) {
+  const az = z.az * RAD;
+  return [z.dist * Math.sin(az), z.dist * Math.cos(az), -ALTURA_OLHOS];
+}
+
+// Pontos dos pés e da cabeça do zumbi na tela
+function zumbiNaTela(R, z, L, A, f) {
+  const p = posicaoZumbi(z);
+  const pes = projetar(R, p, L, A, f);
+  const cab = projetar(R, [p[0], p[1], p[2] + ALTURA_ZUMBI], L, A, f);
+  if (!pes || !cab) return null;
+  return { pes: pes, cab: cab };
+}
+
+// O ponto (x, y) da tela está sobre o corpo do zumbi?
+function acertou(s, x, y) {
+  const dx = s.cab.x - s.pes.x, dy = s.cab.y - s.pes.y;
+  const comp2 = dx*dx + dy*dy;
+  if (comp2 < 1) return false;
+  let t = ((x - s.pes.x)*dx + (y - s.pes.y)*dy) / comp2;
+  t = Math.max(0, Math.min(1, t));
+  const px = s.pes.x + t*dx, py = s.pes.y + t*dy;
+  return Math.hypot(x - px, y - py) <= 0.3 * Math.sqrt(comp2);
+}
+
+function novoZumbi(rumoAtual) {
+  return { az: rumoAtual + (Math.random()*160 - 80), dist: 10 + Math.random()*4, vel: 0.7 + Math.random()*0.6, vivo: true, morte: 0 };
+}
+// LOGICA-FIM
+
+const video = document.getElementById("video");
+const tela = document.getElementById("tela");
+const ctx = tela.getContext("2d");
+const menu = document.getElementById("menu");
+const aviso = document.getElementById("aviso");
+const elVidas = document.getElementById("vidas");
+const elPontos = document.getElementById("pontos");
+
+let L = 0, A = 0, F = 0;
+let ang = { alfa: 0, beta: 90, gama: 0 };
+let temSensor = false, cameraLigada = false;
+let R = matriz(0, 90, 0);
+let zumbis = [], pontos = 0, vidas = 3, rodando = false;
+let ultimo = 0, proxSpawn = 1, tempoJogo = 0, flash = 0, dano = 0;
+
+function ajustarTela() {
+  const dpr = window.devicePixelRatio || 1;
+  L = window.innerWidth; A = window.innerHeight;
+  tela.width = L * dpr; tela.height = A * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  F = (A / 2) / Math.tan(32.5 * RAD); // campo de visão vertical aproximado de 65 graus
+}
+window.addEventListener("resize", ajustarTela);
+ajustarTela();
+
+window.addEventListener("deviceorientation", (e) => {
+  if (e.alpha === null || e.beta === null) return;
+  temSensor = true;
+  ang.alfa = e.alpha; ang.beta = e.beta; ang.gama = e.gamma || 0;
+});
+
+// Sem sensor (ex.: computador): arrastar o dedo ou o mouse para olhar ao redor
+let arrastando = false, ultX = 0, ultY = 0;
+tela.addEventListener("pointerdown", (e) => { arrastando = true; ultX = e.clientX; ultY = e.clientY; });
+window.addEventListener("pointerup", () => { arrastando = false; });
+window.addEventListener("pointermove", (e) => {
+  if (!arrastando || temSensor) return;
+  ang.alfa += (e.clientX - ultX) * 0.25;
+  ang.beta = Math.max(10, Math.min(170, ang.beta + (e.clientY - ultY) * 0.25));
+  ultX = e.clientX; ultY = e.clientY;
+});
+
+function desenharZumbi(s, z) {
+  const dx = s.cab.x - s.pes.x, dy = s.cab.y - s.pes.y;
+  const comp = Math.hypot(dx, dy);
+  ctx.save();
+  ctx.translate(s.pes.x, s.pes.y);
+  ctx.rotate(Math.atan2(dx, -dy));
+  const e = comp / 100;
+  ctx.scale(e, e);
+  if (!z.vivo) ctx.globalAlpha = Math.max(0, 1 - z.morte / 0.35);
+  ctx.fillStyle = "rgba(0,0,0,.35)";
+  ctx.beginPath(); ctx.ellipse(0, 0, 26, 7, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = "#1e293b";                 // pernas
+  ctx.fillRect(-15, -40, 11, 40); ctx.fillRect(4, -40, 11, 40);
+  ctx.fillStyle = "#475569";                 // tronco
+  ctx.fillRect(-21, -76, 42, 38);
+  ctx.fillStyle = "#65a30d";                 // braços
+  ctx.fillRect(-36, -76, 15, 34); ctx.fillRect(21, -76, 15, 34);
+  ctx.fillStyle = "#84cc16";                 // cabeça
+  ctx.beginPath(); ctx.arc(0, -88, 14, 0, 7); ctx.fill();
+  ctx.fillStyle = "#dc2626";                 // olhos
+  ctx.beginPath(); ctx.arc(-5, -90, 3, 0, 7); ctx.arc(5, -90, 3, 0, 7); ctx.fill();
+  ctx.fillStyle = "#3f1d1d";                 // boca
+  ctx.fillRect(-6, -82, 12, 3);
+  ctx.restore();
+}
+
+function desenharMira(sobreZumbi) {
+  const x = L / 2, y = A / 2;
+  ctx.strokeStyle = sobreZumbi ? "#ef4444" : "#ffffff";
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(x, y, 18, 0, 7);
+  ctx.moveTo(x - 28, y); ctx.lineTo(x - 8, y); ctx.moveTo(x + 8, y); ctx.lineTo(x + 28, y);
+  ctx.moveTo(x, y - 28); ctx.lineTo(x, y - 8); ctx.moveTo(x, y + 8); ctx.lineTo(x, y + 28);
+  ctx.stroke();
+}
+
+function ciclo(t) {
+  if (!rodando) return;
+  const dt = Math.min(0.05, (t - ultimo) / 1000);
+  ultimo = t;
+  tempoJogo += dt;
+  R = matriz(ang.alfa, ang.beta, ang.gama);
+
+  proxSpawn -= dt;
+  if (proxSpawn <= 0) {
+    zumbis.push(novoZumbi(rumo(R)));
+    proxSpawn = Math.max(1.2, 3 - tempoJogo / 40);
+  }
+
+  const ritmo = 1 + tempoJogo / 120;
+  for (const z of zumbis) {
+    if (z.vivo) {
+      z.dist -= z.vel * ritmo * dt;
+      if (z.dist < 1.2) {
+        z.vivo = false; z.morte = 1; // some sem pontuar
+        vidas--; dano = 0.45;
+        if (navigator.vibrate) navigator.vibrate(200);
+      }
+    } else {
+      z.morte += dt;
+    }
+  }
+  zumbis = zumbis.filter(z => z.vivo || z.morte < 0.35);
+
+  ctx.clearRect(0, 0, L, A);
+  if (!cameraLigada) { ctx.fillStyle = "#1f2937"; ctx.fillRect(0, 0, L, A); }
+
+  const visiveis = [];
+  for (const z of zumbis) {
+    const s = zumbiNaTela(R, z, L, A, F);
+    if (s) visiveis.push({ z: z, s: s });
+  }
+  visiveis.sort((a, b) => b.s.pes.prof - a.s.pes.prof); // mais longe primeiro
+  let mirando = false;
+  for (const v of visiveis) {
+    desenharZumbi(v.s, v.z);
+    if (v.z.vivo && acertou(v.s, L / 2, A / 2)) mirando = true;
+  }
+  desenharMira(mirando);
+
+  if (flash > 0) {
+    ctx.fillStyle = "rgba(255,255,200," + Math.min(1, flash * 5) + ")";
+    ctx.beginPath(); ctx.arc(L / 2, A / 2, 34, 0, 7); ctx.fill();
+    flash -= dt;
+  }
+  if (dano > 0) {
+    ctx.fillStyle = "rgba(220,38,38," + dano + ")";
+    ctx.fillRect(0, 0, L, A);
+    dano -= dt;
+  }
+
+  elVidas.textContent = "Vidas: " + "♥".repeat(Math.max(0, vidas));
+  elPontos.textContent = "Pontos: " + pontos;
+
+  if (!temSensor && tempoJogo > 1.5 && !aviso.textContent) {
+    aviso.textContent = "Sem sensor de movimento: arraste o dedo para olhar ao redor.";
+  }
+  if (vidas <= 0) { fimDeJogo(); return; }
+  requestAnimationFrame(ciclo);
+}
+
+function atirar() {
+  if (!rodando) return;
+  flash = 0.1;
+  if (navigator.vibrate) navigator.vibrate(25);
+  let alvo = null;
+  for (const z of zumbis) {
+    if (!z.vivo) continue;
+    const s = zumbiNaTela(R, z, L, A, F);
+    if (s && acertou(s, L / 2, A / 2) && (!alvo || s.pes.prof < alvo.prof)) alvo = { z: z, prof: s.pes.prof };
+  }
+  if (alvo) { alvo.z.vivo = false; alvo.z.morte = 0; pontos += 10; }
+}
+document.getElementById("atirar").addEventListener("pointerdown", (e) => { e.preventDefault(); atirar(); });
+
+function fimDeJogo() {
+  rodando = false;
+  document.getElementById("titulo").textContent = "Fim de jogo!";
+  document.getElementById("texto").textContent = "Você fez " + pontos + " pontos.";
+  document.getElementById("iniciar").textContent = "Jogar de novo";
+  menu.style.display = "flex";
+}
+
+async function iniciar() {
+  aviso.textContent = "";
+  if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+    try { await DeviceOrientationEvent.requestPermission(); } catch (e) {}
+  }
+  if (!cameraLigada) {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      aviso.textContent = "Câmera indisponível: a página precisa de conexão segura (HTTPS). Jogando sem câmera.";
+    } else {
+      try {
+        video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+        await video.play();
+        cameraLigada = true;
+      } catch (e) {
+        aviso.textContent = "Câmera indisponível (" + (e.name || "erro") + "). Jogando sem câmera.";
+      }
+    }
+  }
+  zumbis = []; pontos = 0; vidas = 3; tempoJogo = 0; proxSpawn = 1; flash = 0; dano = 0;
+  menu.style.display = "none";
+  rodando = true;
+  ultimo = performance.now();
+  requestAnimationFrame(ciclo);
+}
+document.getElementById("iniciar").addEventListener("click", iniciar);
+
+// Linha de diagnóstico (canto inferior esquerdo): ajuda a descobrir o que está falhando
+const diag = document.getElementById("diag");
+setInterval(() => {
+  diag.textContent = "Seguro: " + (window.isSecureContext ? "sim" : "NÃO") +
+    " | Câmera: " + (cameraLigada ? "ligada" : "desligada") +
+    " | Sensor: " + (temSensor ? "ok (" + Math.round(ang.alfa) + ", " + Math.round(ang.beta) + ", " + Math.round(ang.gama) + ")" : "sem dados");
+}, 300);
+</script>
+</body>
+</html>
